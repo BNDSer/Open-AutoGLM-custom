@@ -55,6 +55,9 @@ Thumbs.db
 /tmp/
 screenshots/
 
+# Local shell file to ignore
+shell.txt
+
 # Keep old files during transition
 call_model.py
 app_package_name.py
