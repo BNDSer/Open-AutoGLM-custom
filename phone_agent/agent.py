@@ -104,6 +104,7 @@ class PhoneAgent:
         while self._step_count < self.agent_config.max_steps:
             result = self._execute_step(is_first=False)
 
+            # Immediately return if finished to avoid repeated thinking
             if result.finished:
                 return result.message or "Task completed"
 
@@ -183,11 +184,24 @@ class PhoneAgent:
 
         # Parse action from response
         try:
-            action = parse_action(response.action)
-        except ValueError:
+            # Check if action is empty before parsing
+            if not response.action or not response.action.strip():
+                if self.agent_config.verbose:
+                    print(f"\n⚠️  Warning: Empty action response from model")
+                    print(f"Raw content: {response.raw_content[:200] if response.raw_content else 'None'}")
+                # Create a note action to allow retry
+                action = do(action="Note", message="Model returned empty action. Please retry with a valid action.")
+            else:
+                action = parse_action(response.action)
+        except ValueError as e:
             if self.agent_config.verbose:
+                print(f"\n⚠️  Warning: Failed to parse action: {e}")
+                print(f"Raw action string: {response.action[:200] if response.action else '(empty)'}")
+                print(f"Raw content: {response.raw_content[:200] if response.raw_content else 'None'}")
                 traceback.print_exc()
-            action = finish(message=response.action)
+            # Create a note action instead of finish to allow retry
+            # This prevents the task from being incorrectly marked as completed
+            action = do(action="Note", message=f"Failed to parse action: {str(e)}. Raw response: {response.action[:100] if response.action else '(empty)'}")
 
         if self.agent_config.verbose:
             # Print thinking process
@@ -195,7 +209,43 @@ class PhoneAgent:
             print("\n" + "=" * 50)
             print(f"💭 {msgs['thinking']}:")
             print("-" * 50)
-            print(response.thinking)
+            # Ensure complete thinking output, handle empty or None cases
+            thinking_output = response.thinking if response.thinking else ""
+            # Remove any remaining XML tags that might interfere with display
+            thinking_output = thinking_output.replace("<think>", "").replace("</think>", "")
+            thinking_output = thinking_output.replace("<think>", "").replace("</think>", "")
+            thinking_output = thinking_output.strip()
+            
+            # If thinking is empty, try to extract from raw content
+            if not thinking_output and response.raw_content:
+                # Try to extract thinking from raw content before action markers
+                raw_content = response.raw_content
+                # Find the position of action markers
+                action_markers = ["do(action=", "do(", "finish(message=", "finish(", "<answer>"]
+                action_pos = len(raw_content)
+                for marker in action_markers:
+                    pos = raw_content.find(marker)
+                    if pos != -1 and pos < action_pos:
+                        action_pos = pos
+                
+                # Extract thinking part before action
+                if action_pos < len(raw_content) and action_pos > 0:
+                    thinking_part = raw_content[:action_pos].strip()
+                    # Clean up XML tags but preserve the actual content
+                    # Remove opening and closing tags
+                    thinking_part = thinking_part.replace("<think>", "").replace("</think>", "")
+                    thinking_part = thinking_part.replace("<think>", "").replace("</think>", "")
+                    thinking_part = thinking_part.replace("<think>", "").replace("</think>", "")
+                    # Remove any leading/trailing whitespace and newlines
+                    thinking_part = thinking_part.strip()
+                    if thinking_part:
+                        thinking_output = thinking_part
+            
+            # If still empty, show a message
+            if not thinking_output:
+                thinking_output = "(思考内容为空或无法解析)"
+            
+            print(thinking_output)
             print("-" * 50)
             print(f"🎯 {msgs['action']}:")
             print(json.dumps(action, ensure_ascii=False, indent=2))
@@ -216,23 +266,28 @@ class PhoneAgent:
                 finish(message=str(e)), screenshot.width, screenshot.height
             )
 
-        # Add assistant response to context
-        self._context.append(
-            MessageBuilder.create_assistant_message(
-                f"<think>{response.thinking}</think><answer>{response.action}</answer>"
-            )
-        )
-
         # Check if finished
         finished = action.get("_metadata") == "finish" or result.should_finish
 
-        if finished and self.agent_config.verbose:
-            msgs = get_messages(self.agent_config.lang)
-            print("\n" + "🎉 " + "=" * 48)
-            print(
-                f"✅ {msgs['task_completed']}: {result.message or action.get('message', msgs['done'])}"
+        # If finished, don't add assistant response to context to avoid repeated thinking
+        # Only add to context if not finished
+        if not finished:
+            # Add assistant response to context
+            # Use <think> and <answer> tags for consistency with parsing logic
+            self._context.append(
+                MessageBuilder.create_assistant_message(
+                    f"<think>{response.thinking}</think><answer>{response.action}</answer>"
+                )
             )
-            print("=" * 50 + "\n")
+        else:
+            # Task is finished, just log the final response without adding to context
+            if self.agent_config.verbose:
+                msgs = get_messages(self.agent_config.lang)
+                print("\n" + "🎉 " + "=" * 48)
+                print(
+                    f"✅ {msgs['task_completed']}: {result.message or action.get('message', msgs['done'])}"
+                )
+                print("=" * 50 + "\n")
 
         return StepResult(
             success=result.success,

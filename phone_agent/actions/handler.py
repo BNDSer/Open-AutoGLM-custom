@@ -1,5 +1,6 @@
 """Action handler for processing AI model outputs."""
 
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -278,21 +279,95 @@ def parse_action(response: str) -> dict[str, Any]:
     Raises:
         ValueError: If the response cannot be parsed.
     """
+    original_response = response
+    
+    # Check for empty response
+    if not response or not response.strip():
+        raise ValueError("Empty action response")
+    
     try:
-        # Try to evaluate as Python dict/function call
+        # Clean the response: remove XML tags and extra content
         response = response.strip()
-        if response.startswith("do"):
-            action = eval(response)
-        elif response.startswith("finish"):
+        
+        # Remove XML tags like </think>, <answer>, </answer>, etc.
+        # Remove all XML-like tags
+        response = re.sub(r'</?[^>]+>', '', response)
+        response = response.strip()
+        
+        # Check again after cleaning
+        if not response:
+            raise ValueError("Action response is empty after cleaning XML tags")
+        
+        # Helper function to find matching closing parenthesis
+        def find_matching_paren(text: str, start_pos: int) -> int:
+            """Find the matching closing parenthesis for an opening one."""
+            depth = 0
+            i = start_pos
+            while i < len(text):
+                if text[i] == '(':
+                    depth += 1
+                elif text[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        return i
+                i += 1
+            return -1
+        
+        # Extract action if it's wrapped in XML tags or has trailing content
+        # Try to find the actual action call (do(...) or finish(...))
+        # Check for both "do(" and "do(action=" formats
+        do_pos = response.find("do(")
+        if do_pos == -1:
+            do_pos = response.find("do(action=")
+        
+        finish_pos = response.find("finish(")
+        if finish_pos == -1:
+            finish_pos = response.find("finish(message=")
+        
+        extracted_action = None
+        
+        if do_pos != -1:
+            # Find the matching closing parenthesis
+            # Calculate offset: "do(" is 2 chars, "do(action=" is 9 chars
+            offset = 2 if response[do_pos:do_pos+3] == "do(" else 9
+            end_pos = find_matching_paren(response, do_pos + offset)
+            if end_pos != -1:
+                extracted_action = response[do_pos:end_pos + 1]
+        elif finish_pos != -1:
+            # Find the matching closing parenthesis
+            # Calculate offset: "finish(" is 6 chars, "finish(message=" is 13 chars
+            offset = 6 if response[finish_pos:finish_pos+7] == "finish(" else 13
+            end_pos = find_matching_paren(response, finish_pos + offset)
+            if end_pos != -1:
+                extracted_action = response[finish_pos:end_pos + 1]
+        
+        # Use extracted action if found, otherwise use cleaned response
+        action_str = extracted_action if extracted_action else response
+        
+        # Try to evaluate as Python dict/function call
+        if action_str.startswith("do"):
+            action = eval(action_str)
+        elif action_str.startswith("finish"):
+            # Extract message from finish(message="...")
+            message_match = re.search(r'message\s*=\s*["\']([^"\']*)["\']', action_str)
+            if message_match:
+                message = message_match.group(1)
+            else:
+                # Fallback: try to extract from finish(message=...)
+                message = action_str.replace("finish(message=", "").rstrip(")").strip('"\'')
             action = {
                 "_metadata": "finish",
-                "message": response.replace("finish(message=", "")[1:-2],
+                "message": message,
             }
         else:
-            raise ValueError(f"Failed to parse action: {response}")
+            raise ValueError(f"Action response does not start with 'do' or 'finish': {action_str[:100]}")
         return action
+    except ValueError:
+        # Re-raise ValueError as-is to avoid nested error messages
+        raise
     except Exception as e:
-        raise ValueError(f"Failed to parse action: {e}")
+        # For other exceptions, wrap with context
+        raise ValueError(f"Failed to parse action (original: {original_response[:100]}): {type(e).__name__}: {e}")
 
 
 def do(**kwargs) -> dict[str, Any]:
