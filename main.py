@@ -14,10 +14,16 @@ Environment Variables:
 """
 
 import argparse
+import fcntl
 import os
+import select
 import shutil
 import subprocess
 import sys
+import termios
+import threading
+import time
+import tty
 from urllib.parse import urlparse
 
 from openai import OpenAI
@@ -448,6 +454,195 @@ def handle_device_commands(args) -> bool:
     return False
 
 
+# Global variable to track if keyboard listener should be active
+_keyboard_listener_active = False
+_keyboard_listener_agent = None
+_keyboard_listener_lock = threading.Lock()
+_listener_thread = None
+_task_executing = False  # Flag to indicate if a task is currently executing
+
+
+def _keyboard_listener():
+    """
+    Background thread to listen for Ctrl+X (ASCII 24, '\x18') keypress.
+    When detected, interrupts the current agent task.
+
+    This listener only activates when a task is executing, and uses
+    a safe method that doesn't interfere with normal terminal output.
+    """
+    global _keyboard_listener_active, _keyboard_listener_agent, _task_executing
+
+    # Save original terminal settings
+    fd = sys.stdin.fileno()
+    old_settings = None
+
+    try:
+        old_settings = termios.tcgetattr(fd)
+    except (termios.error, OSError):
+        # If we can't get terminal settings, keyboard listener won't work
+        return
+
+    # Get original file flags (but don't modify yet)
+    try:
+        orig_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    except (OSError, AttributeError):
+        # fcntl may not be available on all systems
+        orig_flags = None
+
+    # Create a copy of settings for raw mode
+    raw_settings = None
+    try:
+        raw_settings = termios.tcgetattr(fd)
+        # Set raw mode: disable echo, canonical mode, and signal generation
+        # but keep character processing intact
+        raw_settings[3] = raw_settings[3] & ~termios.ECHO  # Disable echo
+        raw_settings[3] = raw_settings[3] & ~termios.ICANON  # Disable canonical mode
+        raw_settings[3] = raw_settings[3] & ~termios.ISIG  # Disable signal generation
+        # Set minimal characters for read and timeout
+        raw_settings[6][termios.VMIN] = 1
+        raw_settings[6][termios.VTIME] = 0
+    except (termios.error, OSError, IndexError):
+        pass
+
+    # Buffer for accumulated characters
+    char_buffer = ""
+
+    try:
+        while _keyboard_listener_active:
+            # Only listen when a task is executing
+            with _keyboard_listener_lock:
+                executing = _task_executing
+
+            if not executing:
+                # Task not executing - ensure stdin is in normal mode for input()
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                except:
+                    pass
+                if orig_flags is not None:
+                    try:
+                        current_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                        if current_flags & os.O_NONBLOCK:
+                            fcntl.fcntl(fd, fcntl.F_SETFL, orig_flags)
+                    except (OSError, AttributeError):
+                        pass
+                # Sleep longer to avoid consuming CPU
+                time.sleep(0.1)
+                char_buffer = ""  # Clear buffer when not executing
+                continue
+
+            # Task is executing - set up for character reading
+            if raw_settings:
+                try:
+                    # Switch to raw mode for character reading
+                    termios.tcsetattr(fd, termios.TCSANOW, raw_settings)
+
+                    # Use select to wait for input with reasonable timeout
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+
+                    if ready:
+                        try:
+                            # Read available characters
+                            char = sys.stdin.read(1)
+                            if char:
+                                char_buffer += char
+
+                                # Check for Ctrl+X (ASCII 24)
+                                if char.endswith('\x18'):
+                                    # Switch back to normal mode before handling interrupt
+                                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+                                    with _keyboard_listener_lock:
+                                        if _keyboard_listener_agent is not None:
+                                            _keyboard_listener_agent.interrupt()
+                                            # Print interrupt message (terminal is in normal mode)
+                                            sys.stdout.write("\n\n⚠️  检测到 Ctrl+X，正在中断当前任务...\n")
+                                            sys.stdout.flush()
+                                    char_buffer = ""
+                                    continue
+
+                                # Check for Ctrl+C (ASCII 3)
+                                elif char.endswith('\x03'):
+                                    # Restore normal mode and flags
+                                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                                    if orig_flags is not None:
+                                        fcntl.fcntl(fd, fcntl.F_SETFL, orig_flags)
+                                    import signal
+                                    os.kill(os.getpid(), signal.SIGINT)
+                                    return
+
+                                # Keep buffer small to avoid memory issues
+                                if len(char_buffer) > 10:
+                                    char_buffer = char_buffer[-5:]
+                        except (IOError, OSError, ValueError):
+                            # Read failed, that's ok in raw mode
+                            pass
+
+                    # Brief sleep to prevent busy-waiting
+                    time.sleep(0.01)
+
+                except (select.error, OSError, ValueError):
+                    # select failed, continue
+                    time.sleep(0.1)
+                    pass
+                except Exception:
+                    # Any other error, continue
+                    time.sleep(0.1)
+                    pass
+
+    except Exception:
+        # Silent failure - keyboard listener is optional
+        pass
+    finally:
+        # Restore original terminal settings and flags
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            if orig_flags is not None:
+                fcntl.fcntl(fd, fcntl.F_SETFL, orig_flags)
+        except (termios.error, OSError, AttributeError):
+            pass
+
+
+def _start_keyboard_listener(agent: PhoneAgent):
+    """Start the keyboard listener thread."""
+    global _keyboard_listener_active, _keyboard_listener_agent, _listener_thread
+    
+    with _keyboard_listener_lock:
+        _keyboard_listener_active = True
+        _keyboard_listener_agent = agent
+    
+    # Start listener thread as daemon so it exits when main thread exits
+    _listener_thread = threading.Thread(target=_keyboard_listener, daemon=True)
+    _listener_thread.start()
+    return _listener_thread
+
+
+def _stop_keyboard_listener():
+    """Stop the keyboard listener thread."""
+    global _keyboard_listener_active, _keyboard_listener_agent, _task_executing
+    
+    with _keyboard_listener_lock:
+        _keyboard_listener_active = False
+        _keyboard_listener_agent = None
+        _task_executing = False
+
+
+def _set_task_executing(executing: bool):
+    """
+    Set the task execution flag to control keyboard listener behavior.
+    
+    When setting to False, give a small delay to ensure keyboard listener
+    thread has time to restore blocking mode before input() is called.
+    """
+    global _task_executing
+    with _keyboard_listener_lock:
+        _task_executing = executing
+    
+    # If setting to False, give keyboard listener time to restore blocking mode
+    if not executing:
+        time.sleep(0.05)  # Small delay to ensure stdin blocking mode is restored
+
+
 def main():
     """Main entry point."""
     args = parse_args()
@@ -509,36 +704,63 @@ def main():
 
     print("=" * 50)
 
+    # Start keyboard listener for Ctrl+X interrupt
+    _start_keyboard_listener(agent)
+    print("💡 提示: 在推理过程中按 Ctrl+X 可以中断当前任务\n")
+
     # Run with provided task or enter interactive mode
-    if args.task:
-        print(f"\nTask: {args.task}\n")
-        result = agent.run(args.task)
-        print(f"\nResult: {result}")
-    else:
-        # Interactive mode
-        print("\nEntering interactive mode. Type 'quit' to exit.\n")
-
-        while True:
+    try:
+        if args.task:
+            print(f"\nTask: {args.task}\n")
+            _set_task_executing(True)
             try:
-                task = input("Enter your task: ").strip()
+                result = agent.run(args.task)
+            finally:
+                _set_task_executing(False)
+            print(f"\nResult: {result}")
+        else:
+            # Interactive mode
+            print("\nEntering interactive mode. Type 'quit' to exit.\n")
 
-                if task.lower() in ("quit", "exit", "q"):
-                    print("Goodbye!")
+            while True:
+                try:
+                    _set_task_executing(False)  # Not executing, allow normal input
+                    task = input("Enter your task: ").strip()
+
+                    if task.lower() in ("quit", "exit", "q"):
+                        print("Goodbye!")
+                        break
+
+                    if not task:
+                        continue
+
+                    print()
+                    _set_task_executing(True)  # Now executing, enable interrupt listening
+                    try:
+                        result = agent.run(task)
+                    finally:
+                        _set_task_executing(False)  # Done executing
+                    
+                    # Check if task was interrupted
+                    if result == "Task interrupted by user":
+                        print(f"\n⚠️  {result}\n")
+                        agent.reset()
+                        continue
+                    
+                    print(f"\nResult: {result}\n")
+                    agent.reset()
+
+                except KeyboardInterrupt:
+                    _set_task_executing(False)
+                    print("\n\nInterrupted. Goodbye!")
                     break
-
-                if not task:
-                    continue
-
-                print()
-                result = agent.run(task)
-                print(f"\nResult: {result}\n")
-                agent.reset()
-
-            except KeyboardInterrupt:
-                print("\n\nInterrupted. Goodbye!")
-                break
-            except Exception as e:
-                print(f"\nError: {e}\n")
+                except Exception as e:
+                    _set_task_executing(False)
+                    print(f"\nError: {e}\n")
+                    agent.reset()
+    finally:
+        # Stop keyboard listener
+        _stop_keyboard_listener()
 
 
 if __name__ == "__main__":

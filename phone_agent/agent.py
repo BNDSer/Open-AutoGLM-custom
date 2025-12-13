@@ -1,6 +1,7 @@
 """Main PhoneAgent class for orchestrating phone automation."""
 
 import json
+import threading
 import traceback
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -80,6 +81,8 @@ class PhoneAgent:
 
         self._context: list[dict[str, Any]] = []
         self._step_count = 0
+        self._interrupted = False
+        self._interrupt_lock = threading.Lock()
 
     def run(self, task: str) -> str:
         """
@@ -91,6 +94,10 @@ class PhoneAgent:
         Returns:
             Final message from the agent.
         """
+        # Reset interrupted flag
+        with self._interrupt_lock:
+            self._interrupted = False
+        
         self._context = []
         self._step_count = 0
 
@@ -99,6 +106,11 @@ class PhoneAgent:
 
         if result.finished:
             return result.message or "Task completed"
+        
+        # Check if interrupted
+        with self._interrupt_lock:
+            if self._interrupted:
+                return "Task interrupted by user"
 
         # Continue until finished or max steps reached
         while self._step_count < self.agent_config.max_steps:
@@ -107,6 +119,11 @@ class PhoneAgent:
             # Immediately return if finished to avoid repeated thinking
             if result.finished:
                 return result.message or "Task completed"
+            
+            # Check if interrupted
+            with self._interrupt_lock:
+                if self._interrupted:
+                    return "Task interrupted by user"
 
         return "Max steps reached"
 
@@ -133,16 +150,61 @@ class PhoneAgent:
         """Reset the agent state for a new task."""
         self._context = []
         self._step_count = 0
+        with self._interrupt_lock:
+            self._interrupted = False
+    
+    def interrupt(self) -> None:
+        """Interrupt the current task execution."""
+        with self._interrupt_lock:
+            self._interrupted = True
+    
+    def is_interrupted(self) -> bool:
+        """Check if the agent has been interrupted."""
+        with self._interrupt_lock:
+            return self._interrupted
 
     def _execute_step(
         self, user_prompt: str | None = None, is_first: bool = False
     ) -> StepResult:
         """Execute a single step of the agent loop."""
+        # Check if interrupted at the start of each step
+        with self._interrupt_lock:
+            if self._interrupted:
+                return StepResult(
+                    success=False,
+                    finished=True,
+                    action=None,
+                    thinking="",
+                    message="Task interrupted by user",
+                )
+        
         self._step_count += 1
 
+        # Check if interrupted before capturing screen
+        with self._interrupt_lock:
+            if self._interrupted:
+                return StepResult(
+                    success=False,
+                    finished=True,
+                    action=None,
+                    thinking="",
+                    message="Task interrupted by user",
+                )
+        
         # Capture current screen state
         screenshot = get_screenshot(self.agent_config.device_id)
         current_app = get_current_app(self.agent_config.device_id)
+        
+        # Check if interrupted after capturing screen
+        with self._interrupt_lock:
+            if self._interrupted:
+                return StepResult(
+                    success=False,
+                    finished=True,
+                    action=None,
+                    thinking="",
+                    message="Task interrupted by user",
+                )
 
         # Build messages
         if is_first:
@@ -168,6 +230,17 @@ class PhoneAgent:
                 )
             )
 
+        # Check if interrupted before model request
+        with self._interrupt_lock:
+            if self._interrupted:
+                return StepResult(
+                    success=False,
+                    finished=True,
+                    action=None,
+                    thinking="",
+                    message="Task interrupted by user",
+                )
+        
         # Get model response
         try:
             response = self.model_client.request(self._context)
@@ -181,6 +254,17 @@ class PhoneAgent:
                 thinking="",
                 message=f"Model error: {e}",
             )
+        
+        # Check if interrupted after model request
+        with self._interrupt_lock:
+            if self._interrupted:
+                return StepResult(
+                    success=False,
+                    finished=True,
+                    action=None,
+                    thinking="",
+                    message="Task interrupted by user",
+                )
 
         # Parse action from response
         try:
